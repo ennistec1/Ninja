@@ -27,15 +27,149 @@ param (
 	[switch]$ShowError
 )
 
+$NinjaInstaller = "https://app.ninjarmm.com/v2/organization/$($env:NINJA_ORGANIZATION_ID)/location/$($env:NINJA_LOCATION_ID)/installer/WINDOWS_MSI"
+
+## for finding uninstall string
+function Get-UninstallString {
+    [cmdletbinding(DefaultParameterSetName = 'GlobalAndAllUsers')]
+  
+    Param (
+      [Parameter(Mandatory = $True, ValueFromPipeline=$true, Position=0,ParameterSetName="Global")]
+      [Parameter(Mandatory = $True, ValueFromPipeline=$true, Position=0,ParameterSetName="GlobalAndCurrentUser")]
+      [Parameter(Mandatory = $True, ValueFromPipeline=$true, Position=0,ParameterSetName="GlobalAndAllUsers")]
+      [Parameter(Mandatory = $True, ValueFromPipeline=$true, Position=0,ParameterSetName="CurrentUser")]
+      [Parameter(Mandatory = $True, ValueFromPipeline=$true, Position=0,ParameterSetName="AllUsers")]
+      [Parameter(Mandatory = $True, ValueFromPipeline=$true, Position=0,ParameterSetName="Global32")]
+      [Parameter(Mandatory = $True, ValueFromPipeline=$true, Position=0,ParameterSetName="GlobalAndCurrentUser32")]
+      [Parameter(Mandatory = $True, ValueFromPipeline=$true, Position=0,ParameterSetName="GlobalAndAllUsers32")]
+      [Parameter(Mandatory = $True, ValueFromPipeline=$true, Position=0,ParameterSetName="CurrentUser32")]
+      [Parameter(Mandatory = $True, ValueFromPipeline=$true, Position=0,ParameterSetName="AllUsers32")]
+      [ValidateNotNullOrEmpty()]
+      [string]$ApplicationName,
+      [Parameter(ParameterSetName="Global32")]
+      [Parameter(ParameterSetName="GlobalAndCurrentUser32")]
+      [Parameter(ParameterSetName="GlobalAndAllUsers32")]
+      [Parameter(ParameterSetName="CurrentUser32")]
+      [Parameter(ParameterSetName="AllUsers32")]
+      [switch]$Wow6432Only,
+      [Parameter(ParameterSetName="Global")]
+      [Parameter(ParameterSetName="GlobalAndCurrentUser")]
+      [Parameter(ParameterSetName="GlobalAndAllUsers")]
+      [Parameter(ParameterSetName="CurrentUser")]
+      [Parameter(ParameterSetName="AllUsers")]
+      [switch]$NoWow6432,
+      [Parameter(ParameterSetName="Global")]
+      [Parameter(ParameterSetName="Global32")]
+      [switch]$Global,
+      [Parameter(ParameterSetName="GlobalAndCurrentUser")]
+      [Parameter(ParameterSetName="GlobalAndCurrentUser32")]
+      [switch]$GlobalAndCurrentUser,
+      [Parameter(ParameterSetName="GlobalAndAllUsers")]
+      [Parameter(ParameterSetName="GlobalAndAllUsers32")]
+      [switch]$GlobalAndAllUsers,
+      [Parameter(ParameterSetName="CurrentUser")]
+      [Parameter(ParameterSetName="CurrentUser32")]
+      [switch]$CurrentUser,
+      [Parameter(ParameterSetName="AllUsers")]
+      [Parameter(ParameterSetName="AllUsers32")]
+      [switch]$AllUsers
+  
+    )
+  
+    # Explicitly set default param to True if used to allow conditionals to work
+    if ($PSCmdlet.ParameterSetName -eq "GlobalAndAllUsers") {
+      $GlobalAndAllUsers = $true
+    }
+  
+    # Check if running with Administrative privileges if required
+    if ($GlobalAndAllUsers -or $AllUsers) {
+      $RunningAsAdmin = (New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+      if ($RunningAsAdmin -eq $false) {
+        Write-Error "Finding all user applications requires administrative privileges"
+        break
+      }
+    }
+  
+    # Empty array to store applications
+    $Apps = @()
+    $32BitPath = "SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+    $64BitPath = "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
+  
+    # Retreive globally installed applications
+    if ($Global -or $GlobalAndAllUsers -or $GlobalAndCurrentUser) {
+      if (!($NoWow6432.IsPresent)) {
+        $Apps += Get-ItemProperty "HKLM:\$32BitPath"
+      }
+      if (!($Wow6432Only.IsPresent)) {
+        $Apps += Get-ItemProperty "HKLM:\$64BitPath"
+      }
+    }
+  
+    if ($CurrentUser -or $GlobalAndCurrentUser) {
+      if (!($NoWow6432.IsPresent)) {
+        $Apps += Get-ItemProperty "Registry::\HKEY_CURRENT_USER\$32BitPath"
+      }
+      if (!($Wow6432Only.IsPresent)) {
+        $Apps += Get-ItemProperty "Registry::\HKEY_CURRENT_USER\$64BitPath"
+      }
+    }
+  
+    if ($AllUsers -or $GlobalAndAllUsers) {
+      $AllProfiles = Get-CimInstance Win32_UserProfile | 
+        Select-Object LocalPath, SID, Loaded, Special | 
+        Where-Object {$_.SID -like "S-1-5-21-*"}
+      $MountedProfiles = $AllProfiles | Where-Object {$_.Loaded -eq $true}
+      $UnmountedProfiles = $AllProfiles | Where-Object {$_.Loaded -eq $false}
+  
+      $MountedProfiles | Foreach-Object {
+        if (!($NoWow6432.IsPresent)) {
+          $Apps += Get-ItemProperty -Path "Registry::\HKEY_USERS\$($_.SID)\$32BitPath"
+        }
+        if (!($Wow6432Only.IsPresent)) {
+          $Apps += Get-ItemProperty -Path "Registry::\HKEY_USERS\$($_.SID)\$64BitPath"
+        }
+      }
+  
+      $UnmountedProfiles | ForEach-Object {
+  
+        $Hive = "$($_.LocalPath)\NTUSER.DAT"
+  
+        if (Test-Path $Hive) {
+              
+          REG LOAD HKU\temp $Hive 2>&1>$null
+  
+          if (!($NoWow6432.IsPresent)) {
+            $Apps += Get-ItemProperty -Path "Registry::\HKEY_USERS\temp\$32BitPath"
+          }
+          if (!($Wow6432Only.IsPresent)) {
+            $Apps += Get-ItemProperty -Path "Registry::\HKEY_USERS\temp\$64BitPath"
+          }
+  
+          # Run manual GC to allow hive to be unmounted
+          [GC]::Collect()
+          [GC]::WaitForPendingFinalizers()
+              
+          REG UNLOAD HKU\temp 2>&1>$null
+  
+        } 
+      }
+    }
+  
+    foreach ($app in $Apps) {
+      if ($app.DisplayName -eq $ApplicationName -and $app.UninstallString -like 'MsiExec*') {
+      return Split-Path -Path $app.PSPath -Leaf
+      }
+    }
+    return ""
+  }
+
 $ErrorActionPreference = 'SilentlyContinue'
 
 if($ShowError -eq $true) {
     $ErrorActionPreference = 'Continue'
 }
 
-Write-Progress -Activity "Running Ninja Removal Script" -PercentComplete 0
-
-#Set-PSDebug -Trace 2
+Write-Progress -Activity "Running Ninja Removal Script" -Status "Running Uninstall" -PercentComplete 0
 
 if([system.environment]::Is64BitOperatingSystem)
 {
@@ -51,7 +185,6 @@ else
 }
 
 $ninjaSoftKey = Join-Path $ninjaPreSoftKey -ChildPath 'NinjaRMMAgent'
-
 $ninjaDir = [string]::Empty
 $ninjaDataDir = Join-Path -Path $env:ProgramData -ChildPath "NinjaRMMAgent"
 
@@ -68,15 +201,15 @@ if($ninjaDirRegLocation)
     }
 }
 
-Write-Progress -Activity "Running Ninja Removal Script" -PercentComplete 10
+Write-Progress -Activity "Running Ninja Removal Script" -Status "Running Uninstall" -PercentComplete 10
 
 if(!$ninjaDir)
 {
     #attempt to get the path from service
-    $ss = Get-WmiObject win32_service -Filter 'Name Like "NinjaRMMAgent"'
+    $ss = Get-CimInstance -ClassName Win32_Service -Filter "name= 'NinjaRMMAgent'"
     if($ss)
     {
-        $ninjaDirService = ($(Get-WmiObject win32_service -Filter 'Name Like "NinjaRMMAgent"').PathName | Split-Path).Replace("`"", "")
+        $ninjaDirService = ($(Get-CimInstance -ClassName Win32_Service -Filter "name= 'NinjaRMMAgent'").PathName | Split-Path).Replace("`"", "")
         if(Join-Path -Path $ninjaDirService -ChildPath "NinjaRMMAgentPatcher.exe" | Test-Path)
         {
             #location confirmed from service location
@@ -92,25 +225,21 @@ if($ninjaDir)
 
 if($Uninstall)
 {
-    Write-Progress -Activity "Running Ninja Removal Script" -Status "Running Uninstall" -PercentComplete 25
-    #there are few measures agent takes to prevent accidental uninstllation
-    #disable those measures now
-    #it automatically takes care if those measures are already removed
-    #it is not possible to check those measures outside of the agent since agent's development comes parralel to this script
+    Write-Progress -Activity "Running Ninja Removal Script" -Status "Running Uninstall" -PercentComplete 30
     Start "$ninjaDir\NinjaRMMAgent.exe" -disableUninstallPrevention NOUI
     # Executes uninstall.exe in Ninja install directory
     $Arguments = @(
-        "/uninstall"
-        $(Get-WmiObject -Class win32_product -Filter "Name='NinjaRMMAgent'").IdentifyingNumber
+        "/x $(Get-UninstallString -ApplicationName NinjaRMMAgent -Wow6432Only -Global)"
         "/quiet"
-        "/log"
-        "NinjaRMMAgent_uninstall.log"
-        "/L*v"
+        "/L*V"
+        "C:\windows\temp\NinjaRMMAgent_uninstall.log"
         "WRAPPED_ARGUMENTS=`"--mode unattended`""
     )
-Start-Process -FilePath "msiexec.exe"  -Verb RunAs -Wait -NoNewWindow -WhatIf -ArgumentList $Arguments
-Write-Progress -Activity "Running Ninja Removal Script" -Status "Uninstall Completed" -PercentComplete 40
-sleep 1
+
+#Start Uninstall
+Start-Process "msiexec.exe" $arguments
+sleep 150
+Write-Progress -Activity "Running Ninja Removal Script" -Status "Uninstall Complete" -PercentComplete 45
 }
 
 
@@ -245,5 +374,7 @@ Write-Progress -Activity "Running Ninja Removal Script" -Status "Completed" -Per
 sleep 1
 
 $error | out-file C:\Windows\Temp\NinjaRemovalScriptError.txt
+
 "`n`n"
-"https://app.ninjarmm.com/v2/organization/$($env:NINJA_ORGANIZATION_ID)/location/$($env:NINJA_LOCATION_ID)/installer/WINDOWS_MSI"
+$NinjaInstaller
+
