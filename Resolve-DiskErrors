@@ -1,1 +1,301 @@
+#Requires -Version 5.1
+
+$GlobalVariableParams = @{
+  Option = "ReadOnly"
+  Scope  = "global"
+  Force  = $true
+}
+
+$global:OutPutSummary = $global:ErrorSummary = $null
+Set-Variable @GlobalVariableParams -Name "Adv_RegistryRoot" -Value "HKLM:SOFTWARE\AdvantageTechnologies"
+Set-Variable @GlobalVariableParams -Name "Adv_FileRoot" -Value "C:\AdvInsight"
+Set-Variable @GlobalVariableParams -Name "Adv_LogNamespace" -Value "AdvantageTechnologies"
+Set-Variable @GlobalVariableParams -Name "Adv_LogSource" -Value "Advantage Insight" # "Maintenance"
+
+function Log-ADVEvent {
+    param(
+        $Message,
+        $entrytype="Information",
+        [int]$eventID=3382,
+        [int]$category=1
+    )
+  # Check if the event log source exists before attempting to create it
+  if (!(Test-Path "HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\$Adv_LogNamespace\$Adv_LogSource")) {    
+      try {
+          New-EventLog -LogName $Adv_LogNamespace -Source $Adv_LogSource -ErrorAction Stop
+          Write-EventLog -LogName $Adv_LogNamespace -Source $Adv_LogSource -EventId 0 -Message "Registered [$Adv_LogSource] as an event source"
+          Write-Information "Registered new event source: $Adv_LogSource"
+      } catch {
+          Write-Warning "Failed to register $Adv_LogSource as an event log source. `nError: $($_.Exception.Message)`n`n"
+          # Exit 2
+      }
+  }
+
+  try {
+      $Message = "$($Message|ConvertTo-Json -Depth 10)"
+      Write-EventLog -LogName $Adv_LogNamespace -Source $Adv_LogSource -EventID $eventID -EntryType $entrytype -Category $category -Message $Message.ToString() -ErrorAction Stop
+  } catch {
+      Write-Warning "Failed to write to event log. `nError: $($_.Exception.Message)`n`n"
+  }
+}
+
+function Get-RecentScan($sub,$days=90){
+    $days = $days * -1
+    $PreviousScans = try{
+        Get-WinEvent -FilterHashTable @{LogName=$Adv_LogNamespace; ProviderName=$Adv_LogSource}
+        $RecentScans = $PreviousScans|Select RecordId, LevelDisplayName, id, task, message|% {
+            $thisItem = $PSItem
+            $tmpitem = $thisItem.Message |ConvertFrom-Json
+            $tmpitem| Add-Member NoteProperty EventId "$($thisItem.Id)"
+            $tmpitem| Add-Member NoteProperty Category "$($thisItem.Task)"
+            $tmpitem| Add-Member NoteProperty RecordId "$($thisItem.RecordId)"
+            $tmpitem| Add-Member NoteProperty entrytype "$($thisItem.LevelDisplayName)"
+            $tmpitem
+        }
+        $FinishedScans = $RecentScans|? Category -eq 2|? {[DateTime]$_.activityTime -gt (Get-Date).AddDays($days)} 
+
+        if(($rfs=$FinishedScans|? subject -eq $sub)){
+            $rfs
+        }else{
+            $null
+        }
+    }catch{
+        $null
+    }
+}
+
+function Scan-DISM(){
+    try {
+        $messageObj = [ordered]@{
+            activityTime = (get-date).ToString()
+            problem = 'Event 11 detected'
+            subject = 'DISM'
+            status = 'ACTIONSTART'
+            console = (Get-Host|Select -exp Name)
+            result = ''
+            message = 'scaning hard drive for errors and file system issues'
+        }
+        
+        Log-ADVEvent -category 1 -message $messageObj
+        Write-Output ($messageObj|ConvertTo-Json -Depth 9)
+        $scanSummery = try{
+            $scanResult = dism /Online /Cleanup-Image /ScanHealth | Out-String
+            ($scanResult -split "`r`n")| select -Last 3|select -First 2
+            #try{"$($scanResult.split("`n")[-3..-2])"}catch{$scanResult}
+        }
+        catch{
+            Write-Host "$($messageObj.subject) FAILED`n$($_)`n`n"
+            throw $_
+        }
+        $ScanDuration = "{0:HH:mm:ss}" -f [datetime](((get-date)-[datetime]($messageObj.activityTime)).Ticks)
+
+        $messageObj.activityTime = (get-date).ToString()
+        $messageObj.status = 'COMPLETE'
+        $messageObj.result = $scanSummery
+        $cookedScan = $scanResult -split "`n" | ForEach-Object {
+            if ($_ -match '(\d{1,3}\.\d%)') { $matches[1] }else{$_}
+        }; $cookedResult = @{n='Results';e={$cookedScan}}
+        $messageObj.message = (''|Select @{n='Duration';e={$ScanDuration}},@{n='ExitCode';e={$LASTEXITCODE}}, $cookedResult)
+
+        $global:OutPutSummary += "$('#'*16)`n$($messageObj.subject)`n$($scanSummery)`n`n"
+        Write-Output ($messageObj|ConvertTo-Json -Depth 9)
+        Log-ADVEvent -category 2 -message $messageObj
+
+    } catch {
+        $theError  = "caught exception at line $($_.InvocationInfo.ScriptLineNumber): $($_.Exception.Message)`n$($_.Exception)`n`n"
+        Write-Output "ERROR: $($theError)"; $global:ErrorSummary += "!! $($_.Exception.GetType().FullName)`n$($theError)"
+    }
+}
+
+function Scan-CHKDSK(){
+    # Run CHKDSK /scan
+    try {
+        $messageObj = [ordered]@{
+            activityTime = (get-date).ToString()
+            problem = 'Event 11 detected'
+            subject = 'CHKDSK'
+            status = 'ACTIONSTART'
+            console = (Get-Host|Select -exp Name)
+            result = ''
+            message = 'scaning hard drive for errors and file system issues'
+        }
+        
+        Log-ADVEvent -category 1 -message $messageObj
+        Write-Output ($messageObj|ConvertTo-Json -Depth 9)
+        $scanSummery = try{
+            $scanResult = chkdsk $DriveLetter /scan | Out-String
+            ($scanResult -split "`r`n`r`n")| select -Last 3|select -First 1
+            #try{"$($scanResult.split("`n")[-14..-16])"}catch{$scanResult}
+        }
+        catch{
+            Write-Host "$($messageObj.subject) FAILED`n$($_)`n`n"
+            throw $_
+        }
+        $ScanDuration = "{0:HH:mm:ss}" -f [datetime](((get-date)-[datetime]($messageObj.activityTime)).Ticks)
+
+        $messageObj.activityTime = (get-date).ToString()
+        $messageObj.status = 'COMPLETE'
+        $messageObj.result = $scanSummery
+        $messageObj.message = (''|Select @{n='Duration';e={$ScanDuration}},@{n='ExitCode';e={$LASTEXITCODE}},@{n='Results';e={$scanResult}})
+        $global:OutPutSummary += "$('#'*16)`n$($messageObj.subject)`n$($scanSummery)`n`n"
+        Write-Output ($messageObj|ConvertTo-Json -Depth 9)
+        Log-ADVEvent -category 2 -message $messageObj
+
+    } catch {
+        $theError  = "caught exception at line $($_.InvocationInfo.ScriptLineNumber): $($_.Exception.Message)`n$($_.Exception)`n`n"
+        Write-Output "ERROR: $($theError)"; $global:ErrorSummary += "!! $($_.Exception.GetType().FullName)`n$($theError)"
+    }
+}
+
+function Scan-SFC(){
+    try {
+        $messageObj = [ordered]@{
+            activityTime = (get-date).ToString()
+            problem = 'Event 11 detected'
+            subject = 'SFC'
+            status = 'ACTIONSTART'
+            console = (Get-Host|Select -exp Name)
+            result = ''
+            message = 'scaning hard drive for errors and file system issues'
+        }
+        
+        Log-ADVEvent -category 1 -message $messageObj
+        Write-Output ($messageObj|ConvertTo-Json -Depth 9)
+        $scanSummery = try{
+            $scanResult = sfc /scannow | Out-String
+            $scanResult = $scanResult -replace '\0', ''
+            switch ($scanResult){
+                {$_.contains("*successfully repaired")} {
+                    "SFC successfully repaired core files.";
+                    break
+                }
+                {$_.contains("system repair pending")} {
+                    "WARNING Restart Windows and run sfc again.";
+                    break
+                }
+                {$_.contains("did not find any")} {
+                    "No component store corruption detected.";
+                    break
+                }
+                {$_.contains("You must be an administrator")} {
+                    "WARNING SFC will not run without Admin privileges.";
+                    break
+                }
+                Default {
+                    "WARNING SFC could not repair core files, Please check manually";
+                }
+            }
+        }
+        catch{
+            "$($messageObj.subject) FAILED`n$($_)`n`n"
+            throw $_
+        }
+        $ScanDuration = "{0:HH:mm:ss}" -f [datetime](((get-date)-[datetime]($messageObj.activityTime)).Ticks)
+
+        $messageObj.activityTime = (get-date).ToString()
+        $messageObj.status = 'COMPLETE'
+        $messageObj.result = $scanSummery
+        $cookedResult = @{n='Results';e={$scanResult.replace('complete.\r\nVerification ', '')}}
+        $messageObj.message = (''|Select @{n='Duration';e={$ScanDuration}},@{n='ExitCode';e={$LASTEXITCODE}}, $cookedResult)
+        $global:OutPutSummary += "$('#'*16)`n$($messageObj.subject)`n$($scanSummery)`n`n"
+        Write-Output ($messageObj|ConvertTo-Json -Depth 9)
+        Log-ADVEvent -category 2 -message $messageObj
+
+    } catch {
+        $theError  = "caught exception at line $($_.InvocationInfo.ScriptLineNumber): $($_.Exception.Message)`n$($_.Exception)`n`n"
+        Write-Output "ERROR: $($theError)"; $global:ErrorSummary += "!! $($_.Exception.GetType().FullName)`n$($theError)"
+    }
+}
+
+Function Get-CrystalDiskInfo{
+$CrystalDiskInfo = Get-ChildItem -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall" | 
+    Get-ItemProperty | 
+    Where-Object {$_.DisplayName -match 'CrystalDiskInfo' } | 
+    Select-Object -Property DisplayName, DisplayVersion, PSChildName, InstallLocation
+$CrystalDiskInfo
+}
+
+function Check-SMARTstatus{
+    $SmartStatus = Get-WmiObject MSStorageDriver_FailurePredictStatus -Namespace root\wmi -ErrorAction SilentlyContinue
+    if ($SmartStatus) {
+        $DriveSmart = $SmartStatus | Where-Object { $_.InstanceName -match $Disk.SerialNumber }
+        if ($DriveSmart) {
+            Write-Output "SMART Status: $(if($DriveSmart.PredictFailure -eq $false){"OK"}else{"Failing"})"
+        } else {
+            Write-Output "SMART data for the selected drive is not available."
+        }
+    } else {
+        Write-Output "Failed to retrieve SMART status."
+    }
+}
+
+#########################################################
+$startDate = Get-Date -Year 2025 -Month 1 -Day 1 -Hour 0 -Minute 0 -Second 0
+$SMARTstatus = Check-SMARTstatus
+$CrystalInfo = Get-CrystalDiskInfo
+$DriveHealth = Get-PhysicalDisk -ErrorAction SilentlyContinue | fl FriendlyName, Model, HealthStatus, SerialNumber|Out-string
+$Event11s = Get-WinEvent -ea 0 -FilterHashtable @{LogName='System'; ID=11; StartTime=$startDate}|? {$_.Message -match 'detected a controller error'}
+
+################################################################################################
+# Determine the affected drive
+$DrivePath = $DriveLetter = $null
+if (($Event11s|Select -exp Message -first 1) -match '\\Device\\Harddisk(\d+)\\DR(\d+)') {
+    $DrivePath = "Harddisk$($matches[0])"
+}
+if ($DrivePath) {
+$DriveLetter = Get-Partition | ?{ "Harddisk$($_.DiskNumber)\\DR$($_.PartitionNumber)" -eq $DrivePath} |
+ Where-Object { $_.DriveLetter } | Select-Object -ExpandProperty DriveLetter
+}
+# Default to system drive if necessary
+if (-not $DriveLetter) {
+    Write-Output "Could not determine the affected disk. Defaulting to system drive."
+    $DriveLetter = $env:SystemDrive
+}else{
+    Write-Output "[$DrivePath] is using $DriveLetter"
+}
+$11count=[int]$Event11s.count
+if($11count -eq 1){
+    Write-Output "This is the First occurred of Event 11 this year"
+}elseif($11count -gt 1){
+    Write-Output "Event ID 11 has occurred $11count times this year."
+}else{
+    Write-Output "Error detecting number of Event 11 events"
+}
+
+
+$SMARTstatus
+$DriveHealth
+
+
+$Recent_Scan = Get-RecentScan CHKDSK
+if($Recent_Scan){
+    Write-Output "Recent $($Recent_Scan|Select -exp subject -u) scan[s] found"
+    Write-Output "  -- Skipping Scan --"
+    Write-Output $Recent_Scan|Select activityTime, result|Out-String
+}else{
+    Scan-CHKDSK
+}
+
+$Recent_Scan = Get-RecentScan DISM
+if($Recent_Scan){
+    Write-Output "Recent $($Recent_Scan|Select -exp subject -u) scan[s] found"
+    Write-Output "  -- Skipping Scan --"
+    Write-Output $Recent_Scan|Select activityTime, result|Out-String
+}else{
+    Scan-DISM
+}
+
+
+<#
+## Commented out, not implemented yet
+
+$Recent_Scan = Get-RecentScan SFC
+if($Recent_Scan){
+    Write-Output "Recent $($Recent_Scan|Select -exp subject -u) scan[s] found"
+    Write-Output "  -- Skipping Scan --"
+    Write-Output $Recent_Scan|Select activityTime, result|Out-String
+}else{
+    Scan-SFC
+}
+#>
 
